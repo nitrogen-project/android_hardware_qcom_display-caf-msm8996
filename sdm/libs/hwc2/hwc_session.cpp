@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2018, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2014-2019, The Linux Foundation. All rights reserved.
  * Not a Contribution.
  *
  * Copyright 2015 The Android Open Source Project
@@ -194,6 +194,9 @@ int HWCSession::Init() {
     // Create display if it is connected, else wait for hotplug connect event.
     if (hw_disp_info.is_connected) {
       status = CreateExternalDisplay(HWC_DISPLAY_PRIMARY);
+    } else {
+      CreateNullDisplay();
+      null_display_active_ = true;
     }
   } else {
     // Create and power on primary display
@@ -212,6 +215,7 @@ int HWCSession::Init() {
     return status;
   }
 
+  is_composer_up_ = true;
   return 0;
 }
 
@@ -541,6 +545,15 @@ int32_t HWCSession::PresentDisplay(hwc2_device_t *device, hwc2_display_t display
     }
   }
 
+  if (display == HWC_DISPLAY_PRIMARY) {
+    if (!hwc_session->first_commit_) {
+      hwc_session->first_commit_ = true;
+    }
+    if (hwc_session->external_pending_hotplug_) {
+      notify_hotplug = true;
+      hwc_session->external_pending_hotplug_ = false;
+    }
+  }
   if (notify_hotplug) {
     hwc_session->HotPlug(HWC_DISPLAY_EXTERNAL, HWC2::Connection::Connected);
   }
@@ -1059,12 +1072,44 @@ android::status_t HWCSession::notifyCallback(uint32_t command, const android::Pa
       status = SetColorModeOverride(input_parcel);
       break;
 
+    case qService::IQService::SET_DSI_CLK:
+      if (!input_parcel) {
+        DLOGE("QService command = %d: input_parcel needed.", command);
+        break;
+      }
+      status = SetDsiClk(input_parcel);
+      break;
+
+    case qService::IQService::GET_DSI_CLK:
+      if (!input_parcel || !output_parcel) {
+        DLOGE("QService command = %d: input_parcel and output_parcel needed.", command);
+        break;
+      }
+      status = GetDsiClk(input_parcel, output_parcel);
+      break;
+
+    case qService::IQService::GET_SUPPORTED_DSI_CLK:
+      if (!input_parcel || !output_parcel) {
+        DLOGE("QService command = %d: input_parcel and output_parcel needed.", command);
+        break;
+      }
+      status = GetSupportedDsiClk(input_parcel, output_parcel);
+      break;
+
+    case qService::IQService::GET_COMPOSER_STATUS:
+      output_parcel->writeInt32(getComposerStatus());
+      break;
+
     default:
       DLOGW("QService command = %d is not supported", command);
       return -EINVAL;
   }
 
   return status;
+}
+
+android::status_t HWCSession::getComposerStatus() {
+  return is_composer_up_;
 }
 
 android::status_t HWCSession::HandleGetDisplayAttributesForConfig(const android::Parcel
@@ -1191,6 +1236,45 @@ void HWCSession::SetFrameDumpConfig(const android::Parcel *input_parcel) {
       hwc_display_[HWC_DISPLAY_VIRTUAL]->SetFrameDumpConfig(frame_dump_count, bit_mask_layer_type);
     }
   }
+}
+
+android::status_t HWCSession::SetDsiClk(const android::Parcel *input_parcel) {
+  int disp_id = input_parcel->readInt32();
+  uint64_t clk = UINT32(input_parcel->readInt64());
+  if (disp_id != HWC_DISPLAY_PRIMARY || !hwc_display_[disp_id]) {
+    return -EINVAL;
+  }
+
+  return hwc_display_[disp_id]->SetDynamicDSIClock(clk);
+}
+
+android::status_t HWCSession::GetDsiClk(const android::Parcel *input_parcel,
+                                        android::Parcel *output_parcel) {
+  int disp_id = input_parcel->readInt32();
+  if (disp_id != HWC_DISPLAY_PRIMARY || !hwc_display_[disp_id]) {
+    return -EINVAL;
+  }
+
+  uint64_t bitrate = 0;
+  hwc_display_[disp_id]->GetDynamicDSIClock(&bitrate);
+  output_parcel->writeUint64(bitrate);
+  return 0;
+}
+
+android::status_t HWCSession::GetSupportedDsiClk(const android::Parcel *input_parcel,
+                                                 android::Parcel *output_parcel) {
+  int disp_id = input_parcel->readInt32();
+  if (disp_id != HWC_DISPLAY_PRIMARY || !hwc_display_[disp_id]) {
+    return -EINVAL;
+  }
+
+  std::vector<uint64_t> bit_rates;
+  hwc_display_[disp_id]->GetSupportedDSIClock(&bit_rates);
+  output_parcel->writeInt32(INT32(bit_rates.size()));
+  for (auto &bit_rate : bit_rates) {
+    output_parcel->writeUint64(bit_rate);
+  }
+  return 0;
 }
 
 android::status_t HWCSession::SetMixerResolution(const android::Parcel *input_parcel) {
@@ -1465,6 +1549,10 @@ void HWCSession::ResetPanel() {
 int HWCSession::HotPlugHandler(bool connected) {
   int status = 0;
   bool notify_hotplug = false;
+  if (!first_commit_ && !connected && hdmi_is_primary_) {
+    DLOGI("Disconnect event before first commit");
+    return 0;
+  }
 
   // To prevent sending events to client while a lock is held, acquire scope locks only within
   // below scope so that those get automatically unlocked after the scope ends.
@@ -1475,13 +1563,15 @@ int HWCSession::HotPlugHandler(bool connected) {
     // If HDMI is not primary, create/destroy external display normally.
     if (hdmi_is_primary_) {
       SCOPE_LOCK(locker_[HWC_DISPLAY_PRIMARY]);
-      if (hwc_display_[HWC_DISPLAY_PRIMARY]) {
+      if (!null_display_active_) {
         status = hwc_display_[HWC_DISPLAY_PRIMARY]->SetState(connected);
       } else {
-        status = CreateExternalDisplay(HWC_DISPLAY_PRIMARY);
-        notify_hotplug = true;
+        // This cannot be avoided due to SurfaceFlinger design
+        // limitation in Android P.
+        HWCDisplayExternal::Destroy(hwc_display_[HWC_DISPLAY_PRIMARY]);
+        DLOGE("External display is connected. Abort!!");
+        abort();
       }
-
       break;
     }
 
@@ -1531,6 +1621,16 @@ int HWCSession::HotPlugHandler(bool connected) {
       // new display connection.
       uint32_t vsync_period = UINT32(GetVsyncPeriod(HWC_DISPLAY_PRIMARY));
       usleep(vsync_period * 2 / 1000);
+    }
+  }
+
+  // Cache hotplug for external till first present is called
+  if (notify_hotplug) {
+    if (!hdmi_is_primary_) {
+      if (!first_commit_) {
+        notify_hotplug = false;
+        external_pending_hotplug_ = connected;
+      }
     }
   }
 
@@ -1627,5 +1727,13 @@ Return<int32_t> HWCSession::setDisplayAnimating(uint64_t display_id, bool animat
                              &HWCDisplay::SetDisplayAnimating, animating);
 }
 #endif
+
+void HWCSession::CreateNullDisplay() {
+  auto hwc_display = &hwc_display_[HWC_DISPLAY_PRIMARY];
+
+  HWCDisplayDummy::Create(core_intf_, &buffer_allocator_, &callbacks_, qservice_,
+                          hwc_display);
+}
+
 
 }  // namespace sdm

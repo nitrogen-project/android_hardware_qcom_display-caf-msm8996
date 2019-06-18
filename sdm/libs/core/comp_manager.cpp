@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2014 - 2017, The Linux Foundation. All rights reserved.
+* Copyright (c) 2014 - 2018, The Linux Foundation. All rights reserved.
 *
 * Redistribution and use in source and binary forms, with or without modification, are permitted
 * provided that the following conditions are met:
@@ -236,24 +236,37 @@ void CompManager::PrepareStrategyConstraints(Handle comp_handle, HWLayers *hw_la
   // Limit 2 layer SDE Comp if its not a Primary Display.
   // Safe mode is the policy for External display on a low end device.
   if (!display_comp_ctx->is_primary_panel) {
+    bool secure_ex_layer = false;
     constraints->max_layers = max_sde_ext_layers_;
     constraints->safe_mode = (low_end_hw && !hw_res_info_.separate_rotator) ? true : safe_mode_;
-    if(hw_layers->info.stack->flags.secure_present)
-        secure_external_layer_ = true;
-    else
-        secure_external_layer_ = false;
+    if (hw_layers->info.stack->flags.secure_present) {
+        secure_ex_layer = true;
+    }
+    else {
+        secure_ex_layer = false;
+    }
+    if (secure_external_layer_ != secure_ex_layer) {
+      secure_external_layer_ = secure_ex_layer;
+      secure_external_transition_ = true;
+    }
   }
 
   // When Secure layer is present on external, GPU composition should be policy
-  // for Primary on low end devices
+  // for Primary on low end devices. // Safe mode needs to be kicked in primary
+  // during secure transition on external
   if(display_comp_ctx->is_primary_panel && (registered_displays_.count() > 1)
-          && low_end_hw && secure_external_layer_) {
-    DLOGV_IF(kTagCompManager,"Secure layer present for LET. Fallingback to GPU");
-    hw_layers->info.stack->flags.skip_present = 1;
-    for(auto &layer : hw_layers->info.stack->layers) {
-      if(layer->composition != kCompositionGPUTarget) {
-        layer->flags.skip = 1;
+          && secure_external_layer_) {
+    if (low_end_hw) {
+      DLOGV_IF(kTagCompManager,"Secure layer present for LET. Fallingback to GPU");
+      hw_layers->info.stack->flags.skip_present = 1;
+      for(auto &layer : hw_layers->info.stack->layers) {
+        if(layer->composition != kCompositionGPUTarget) {
+          layer->flags.skip = 1;
+        }
       }
+    } else if (secure_external_transition_) {
+      constraints->safe_mode = true;
+      secure_external_transition_ = false;
     }
   }
 
@@ -265,16 +278,9 @@ void CompManager::PrepareStrategyConstraints(Handle comp_handle, HWLayers *hw_la
   // Set use_cursor constraint to Strategy
   constraints->use_cursor = display_comp_ctx->valid_cursor;
 
-  // TODO(user): App layer count will change for hybrid composition
-  uint32_t app_layer_count = UINT32(hw_layers->info.stack->layers.size()) - 1;
   if (display_comp_ctx->idle_fallback || display_comp_ctx->thermal_fallback_) {
     // Handle the idle timeout by falling back
     constraints->safe_mode = true;
-  }
-
-  // Avoid safe mode, if there is only one app layer.
-  if (app_layer_count == 1) {
-     constraints->safe_mode = false;
   }
 }
 
